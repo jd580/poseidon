@@ -6,11 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	agentstructs "github.com/MythicMeta/MythicContainer/agent_structs"
-	"github.com/MythicMeta/MythicContainer/mythicrpc"
-	"github.com/google/uuid"
-	"github.com/pelletier/go-toml"
-	"golang.org/x/exp/slices"
 	"io"
 	"os"
 	"os/exec"
@@ -18,6 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	agentstructs "github.com/MythicMeta/MythicContainer/agent_structs"
+	"github.com/MythicMeta/MythicContainer/mythicrpc"
+	"github.com/google/uuid"
+	"github.com/pelletier/go-toml"
+	"golang.org/x/exp/slices"
 )
 
 const version = "2.2.10"
@@ -37,7 +38,7 @@ var payloadDefinition = agentstructs.PayloadType{
 	CanBeWrappedByTheFollowingPayloadTypes: []string{},
 	SupportsDynamicLoading:                 false,
 	Description:                            fmt.Sprintf("A fully featured macOS and Linux Golang agent.\nVersion %s\nNeeds Mythic 3.3.0+\nNOTE: P2P not compatible with v2.1 agents!", version),
-	SupportedC2Profiles:                    []string{"http", "websocket", "tcp", "dynamichttp", "webshell", "httpx"},
+	SupportedC2Profiles:                    []string{"http", "websocket", "tcp", "dynamichttp", "webshell", "httpx", "webrtc"},
 	MythicEncryptsData:                     true,
 	BuildParameters: []agentstructs.BuildParameter{
 		{
@@ -82,7 +83,7 @@ var payloadDefinition = agentstructs.PayloadType{
 			Description:   "Prioritize the order in which egress connections are made (if including multiple egress c2 profiles)",
 			Required:      false,
 			ParameterType: agentstructs.BUILD_PARAMETER_TYPE_ARRAY,
-			DefaultValue:  []string{"http", "websocket", "dynamichttp", "httpx"},
+			DefaultValue:  []string{"webrtc", "http", "websocket", "dynamichttp", "httpx"},
 		},
 		{
 			Name:          "egress_failover",

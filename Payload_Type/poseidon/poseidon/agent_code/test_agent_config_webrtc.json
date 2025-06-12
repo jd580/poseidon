@@ -1,0 +1,12 @@
+{
+  "signaling_server": "wss://your-domain.com/ws",
+  "auth_key": "secret123",
+  "turn_server": "turn:turnserver.example.com:3478",
+  "turn_username": "user",
+  "turn_password": "pass",
+  "killdate": "2025-04-04",
+  "callback_interval": 10,
+  "callback_jitter": 23,
+  "encrypted_exchange_check": true,
+  "AESPSK": "aes256_hmac"
+}
