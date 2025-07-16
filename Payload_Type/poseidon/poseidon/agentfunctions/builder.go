@@ -137,7 +137,7 @@ var payloadDefinition = agentstructs.PayloadType{
 			}
 			atLeastOneCallbackWithinRange := false
 			for activeC2, _ := range sleepInfo {
-				if activeC2 == "websocket" && callback.LastCheckin.Unix() == 0 {
+				if (activeC2 == "websocket" || activeC2 == "webrtc") && callback.LastCheckin.Unix() == 0 { // checks the two profiles that support push c2
 					atLeastOneCallbackWithinRange = true
 					continue
 				}
